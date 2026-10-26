@@ -113,6 +113,25 @@ class StmtLowerer:
         ctx.emit(f"add.s32 {addr_reg}, {base_reg}, {byte_off};")
         return addr_reg
 
+    def _emit_barrier(self, barrier_id: int, count: int | None, warp: bool) -> None:
+        if warp:
+            self.ctx.emit("bar.warp.sync 0xffffffff;")
+        elif count is None:
+            self.ctx.emit(f"bar.sync {barrier_id};")
+        else:
+            self.ctx.emit(f"bar.sync {barrier_id}, {count};")
+
+    @staticmethod
+    def _require_f32(dtype: Any, what: str) -> None:
+        name = getattr(dtype, "name", dtype)
+        if name not in (None, "f32", "float"):
+            raise NotImplementedError(f"{what}: dtype {name!r} (only f32)")
+
+    @staticmethod
+    def _require_no_swizzle(swizzle: Any, what: str) -> None:
+        if str(swizzle) not in ("NONE", "None", "SwizzleKind.NONE"):
+            raise NotImplementedError(f"{what}: swizzle {swizzle!r}")
+
     def _lower_init(self, s: Any) -> None:
         ctx = self.ctx
         reg = ctx.alloc_f32()
@@ -126,68 +145,73 @@ class StmtLowerer:
         reg, dtype = lower_expr(self.ctx, s.value)
         self.ctx.bind_var(s.name, reg, dtype)
 
+    def _assign_dst(self, s: Any) -> str:
+        if s.name in self.init_vars and s.name in self.ctx.var_map:
+            return self.ctx.get_var(s.name)[0]
+        return self.ctx.alloc_f32()
+
     def _lower_assign(self, s: Any) -> None:
         ctx = self.ctx
         op_name = getattr(s.op, "name", str(s.op))
         arg_regs = [ctx.get_var(a)[0] for a in s.args]
 
         if op_name == "copy":
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"mov.f32 {dst}, {arg_regs[0]};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name == "add":
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"add.f32 {dst}, {arg_regs[0]}, {arg_regs[1]};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name == "subtract":
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"sub.f32 {dst}, {arg_regs[0]}, {arg_regs[1]};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name == "multiply":
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"mul.f32 {dst}, {arg_regs[0]}, {arg_regs[1]};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name == "divide":
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"div.rn.f32 {dst}, {arg_regs[0]}, {arg_regs[1]};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name == "reciprocal":
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"rcp.rn.f32 {dst}, {arg_regs[0]};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name == "sqrt":
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"sqrt.rn.f32 {dst}, {arg_regs[0]};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name == "rsqrt":
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"rsqrt.approx.f32 {dst}, {arg_regs[0]};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name in ("exp", "exp_fast"):
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             t = ctx.alloc_f32()
             # 0f3fb8aa3b is log2(e)
             ctx.emit(f"mul.f32 {t}, {arg_regs[0]}, 0f3fb8aa3b;")
             ctx.emit(f"ex2.approx.f32 {dst}, {t};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name == "maximum":
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"max.f32 {dst}, {arg_regs[0]}, {arg_regs[1]};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name == "minimum":
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"min.f32 {dst}, {arg_regs[0]}, {arg_regs[1]};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name == "abs":
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"abs.f32 {dst}, {arg_regs[0]};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name in ("negative", "neg"):
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"neg.f32 {dst}, {arg_regs[0]};")
             ctx.bind_var(s.name, dst, "f32")
         elif op_name == "relu":
-            dst = ctx.alloc_f32()
+            dst = self._assign_dst(s)
             ctx.emit(f"max.f32 {dst}, {arg_regs[0]}, 0f00000000;")
             ctx.bind_var(s.name, dst, "f32")
         else:
@@ -216,6 +240,7 @@ class StmtLowerer:
 
     def _lower_load(self, s: Any) -> None:
         ctx = self.ctx
+        self._require_f32(s.dtype, f"Load {s.input}")
         is_smem = s.input in self.smem_shapes
         shape = self.smem_shapes[s.input] if is_smem else self.buffer_shapes[s.input]
         flat_idx = self._calc_flat_index(s.index, shape)
@@ -239,6 +264,8 @@ class StmtLowerer:
 
     def _lower_write(self, s: Any) -> None:
         ctx = self.ctx
+        self._require_f32(s.value_dtype, f"Write {s.output}")
+        self._require_no_swizzle(s.swizzle, f"Write {s.output}")
         is_smem = s.output in self.smem_shapes
         shape = self.smem_shapes[s.output] if is_smem else self.buffer_shapes[s.output]
         flat_idx = self._calc_flat_index(s.index, shape)
@@ -377,6 +404,8 @@ class StmtLowerer:
 
     def _lower_tree_halve(self, s: Any) -> None:
         ctx = self.ctx
+        if s.inner is not None:
+            raise NotImplementedError(f"TreeHalve.inner={s.inner!r} (segmented tree)")
         tid_reg, _ = ctx.get_var(s.tid_var)
         cur = s.length
 
@@ -411,7 +440,7 @@ class StmtLowerer:
                 ctx.emit(f"st.shared.f32 [{addr_self}], {res_reg};")
 
             ctx.emit_label(lbl_skip)
-            ctx.emit("bar.sync 0;")
+            self._emit_barrier(s.barrier_id, s.barrier_count, False)
             cur = stride
 
         zero_reg = ctx.alloc_u32()
@@ -421,10 +450,11 @@ class StmtLowerer:
             bcast_reg = ctx.alloc_f32()
             ctx.emit(f"ld.shared.f32 {bcast_reg}, [{addr_zero}];")
             ctx.bind_var(s_name, bcast_reg, "f32")
-        ctx.emit("bar.sync 0;")
+        self._emit_barrier(s.barrier_id, s.barrier_count, False)
 
     def _lower_cp_async_copy(self, s: Any) -> None:
         ctx = self.ctx
+        self._require_no_swizzle(s.swizzle, f"CpAsyncCopy {s.smem}")
         src_shape = self.buffer_shapes[s.src]
         src_flat = self._calc_flat_index(s.src_index, src_shape)
         src_addr = self._get_buffer_addr(s.src, src_flat)
@@ -455,7 +485,7 @@ class StmtLowerer:
             "StridedLoop": self._lower_strided_loop,
             "Loop": self._lower_loop,
             "Cond": self._lower_cond,
-            "Sync": lambda _: self.ctx.emit("bar.sync 0;"),
+            "Sync": lambda st: self._emit_barrier(st.barrier_id, st.count, st.warp),
             "Smem": lambda _: None,
             "WarpShuffle": self._lower_warp_shuffle,
             "TreeHalve": self._lower_tree_halve,

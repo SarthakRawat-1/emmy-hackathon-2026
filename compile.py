@@ -332,6 +332,9 @@ def main() -> None:
 
     smem_shapes, smem_bytes_map, smem_offsets = resolve_shared_memory(tile)
     dynamic_smem = (desc.smem_bytes > 0)
+    pool_end = max((smem_offsets[n] + smem_bytes_map[n] for n in smem_offsets), default=0)
+    if dynamic_smem and pool_end > desc.smem_bytes:
+        raise ValueError(f"shared-memory layout needs {pool_end} bytes but launch provides {desc.smem_bytes}")
 
     ctx = CodegenContext(desc.entry, desc.arg_order)
     lbl_exit = emit_prologue(ctx, desc, tile)
