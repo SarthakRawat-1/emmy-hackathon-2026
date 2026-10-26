@@ -154,8 +154,23 @@ def emit_prologue(ctx: CodegenContext, desc: KernelDescriptor, tile: kir.Tile) -
     r_gid = ctx.alloc_u32()
 
     ctx.emit(f"mov.u32 {r_tid}, %tid.x;")
-    if len(desc.grid) > 1 and desc.grid[1] > 1:
-        # Multi-dimensional grid decomposition
+    if len(desc.grid) > 2 and desc.grid[2] > 1:
+        # 3D grid decomposition
+        r_cx = ctx.alloc_u32()
+        r_cy = ctx.alloc_u32()
+        r_cz = ctx.alloc_u32()
+        r_nx = ctx.alloc_u32()
+        r_ny = ctx.alloc_u32()
+        r_tmp = ctx.alloc_u32()
+        ctx.emit(f"mov.u32 {r_cx}, %ctaid.x;")
+        ctx.emit(f"mov.u32 {r_cy}, %ctaid.y;")
+        ctx.emit(f"mov.u32 {r_cz}, %ctaid.z;")
+        ctx.emit(f"mov.u32 {r_nx}, %nctaid.x;")
+        ctx.emit(f"mov.u32 {r_ny}, %nctaid.y;")
+        ctx.emit(f"mad.lo.u32 {r_tmp}, {r_cz}, {r_ny}, {r_cy};")
+        ctx.emit(f"mad.lo.u32 {r_ctaid}, {r_tmp}, {r_nx}, {r_cx};")
+    elif len(desc.grid) > 1 and desc.grid[1] > 1:
+        # 2D grid decomposition
         r_cx = ctx.alloc_u32()
         r_cy = ctx.alloc_u32()
         r_nx = ctx.alloc_u32()
@@ -166,8 +181,15 @@ def emit_prologue(ctx: CodegenContext, desc: KernelDescriptor, tile: kir.Tile) -
     else:
         ctx.emit(f"mov.u32 {r_ctaid}, %ctaid.x;")
 
-    ctx.emit(f"mov.u32 {r_ntid}, %ntid.x;")
-    ctx.emit(f"mad.lo.u32 {r_gid}, {r_ctaid}, {r_ntid}, {r_tid};")
+    if getattr(tile, "aux_threads", 0) and getattr(tile, "block_threads", None):
+        r_bt = ctx.alloc_u32()
+        ctx.emit(f"mov.u32 {r_bt}, {tile.block_threads};")
+        r_rem = ctx.alloc_u32()
+        ctx.emit(f"rem.u32 {r_rem}, {r_tid}, {r_bt};")
+        ctx.emit(f"mad.lo.u32 {r_gid}, {r_ctaid}, {r_bt}, {r_rem};")
+    else:
+        ctx.emit(f"mov.u32 {r_ntid}, %ntid.x;")
+        ctx.emit(f"mad.lo.u32 {r_gid}, {r_ctaid}, {r_ntid}, {r_tid};")
 
     r_lane = ctx.alloc_u32()
     r_warp = ctx.alloc_u32()
@@ -356,6 +378,7 @@ def main() -> None:
         raise ValueError(f"shared-memory layout needs {pool_end} bytes but launch provides {desc.smem_bytes}")
 
     ctx = CodegenContext(desc.entry, desc.arg_order)
+    ctx.buffer_shapes = buffer_shapes
     lbl_exit = emit_prologue(ctx, desc, tile)
 
     lowerer = StmtLowerer(ctx, buffer_shapes, smem_shapes, smem_offsets, dynamic_smem, buffer_elem_bytes)

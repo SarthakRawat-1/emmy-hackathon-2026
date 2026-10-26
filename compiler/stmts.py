@@ -168,6 +168,9 @@ class StmtLowerer:
         "abs": "abs.f32",
         "negative": "neg.f32",
         "neg": "neg.f32",
+        "sin": "sin.approx.f32",
+        "cos": "cos.approx.f32",
+        "tanh": "tanh.approx.f32",
     }
 
     BINARY_OPS = {
@@ -206,6 +209,8 @@ class StmtLowerer:
             ctx.emit(f"mul.f32 {dst}, {t}, 0f3f317218;")
         elif op_name == "relu":
             ctx.emit(f"max.f32 {dst}, {arg_regs[0]}, 0f00000000;")
+        elif op_name == "square":
+            ctx.emit(f"mul.f32 {dst}, {arg_regs[0]}, {arg_regs[0]};")
         else:
             raise NotImplementedError(f"unsupported assign op: {op_name}")
 
@@ -397,10 +402,14 @@ class StmtLowerer:
 
     def _lower_tree_halve(self, s: Any) -> None:
         ctx = self.ctx
-        if s.inner is not None:
-            raise NotImplementedError(f"TreeHalve.inner={s.inner!r} (segmented tree)")
         tid_reg, _ = ctx.get_var(s.tid_var)
         cur = s.length
+
+        inner_scale = None
+        inner_reg = None
+        if s.inner is not None:
+            iv_name, inner_scale = s.inner
+            inner_reg, _ = ctx.get_var(iv_name)
 
         while cur > 1:
             stride = (cur + 1) // 2
@@ -413,9 +422,18 @@ class StmtLowerer:
             partner_tid = ctx.alloc_u32()
             ctx.emit(f"add.s32 {partner_tid}, {tid_reg}, {stride};")
 
+            if inner_reg is not None and inner_scale is not None:
+                slot_self = ctx.alloc_u32()
+                slot_partner = ctx.alloc_u32()
+                ctx.emit(f"mad.lo.s32 {slot_self}, {tid_reg}, {inner_scale}, {inner_reg};")
+                ctx.emit(f"mad.lo.s32 {slot_partner}, {partner_tid}, {inner_scale}, {inner_reg};")
+            else:
+                slot_self = tid_reg
+                slot_partner = partner_tid
+
             for buf_name, s_name, sb_name in zip(s.bufs, s.state, s.state_b):
-                addr_self = self._get_smem_addr(buf_name, tid_reg)
-                addr_partner = self._get_smem_addr(buf_name, partner_tid)
+                addr_self = self._get_smem_addr(buf_name, slot_self)
+                addr_partner = self._get_smem_addr(buf_name, slot_partner)
 
                 reg_self = ctx.alloc_f32()
                 reg_partner = ctx.alloc_f32()
@@ -428,7 +446,7 @@ class StmtLowerer:
             self.lower_statements(s.combine_states)
 
             for buf_name, s_name in zip(s.bufs, s.state):
-                addr_self = self._get_smem_addr(buf_name, tid_reg)
+                addr_self = self._get_smem_addr(buf_name, slot_self)
                 res_reg, _ = ctx.get_var(s_name)
                 ctx.emit(f"st.shared.f32 [{addr_self}], {res_reg};")
 
@@ -436,14 +454,58 @@ class StmtLowerer:
             self._emit_barrier(s.barrier_id, s.barrier_count, False)
             cur = stride
 
-        zero_reg = ctx.alloc_u32()
-        ctx.emit(f"mov.u32 {zero_reg}, 0;")
+        if inner_reg is not None:
+            root_slot = inner_reg
+        else:
+            zero_reg = ctx.alloc_u32()
+            ctx.emit(f"mov.u32 {zero_reg}, 0;")
+            root_slot = zero_reg
+
         for buf_name, s_name in zip(s.bufs, s.state):
-            addr_zero = self._get_smem_addr(buf_name, zero_reg)
+            addr_root = self._get_smem_addr(buf_name, root_slot)
             bcast_reg = ctx.alloc_f32()
-            ctx.emit(f"ld.shared.f32 {bcast_reg}, [{addr_zero}];")
+            ctx.emit(f"ld.shared.f32 {bcast_reg}, [{addr_root}];")
             ctx.bind_var(s_name, bcast_reg, "f32")
         self._emit_barrier(s.barrier_id, s.barrier_count, False)
+
+    def _lower_select(self, s: Any) -> None:
+        branches = list(s.branches)
+        res_expr: expr.Expr = expr.CastExpr("float", expr.Var(branches[-1].value))
+        for b in reversed(branches[:-1]):
+            res_expr = expr.TernaryExpr(cond=b.select, if_true=expr.CastExpr("float", expr.Var(b.value)), if_false=res_expr)
+        reg, dtype = lower_expr(self.ctx, res_expr)
+        self.ctx.bind_var(s.name, reg, dtype)
+
+    def _lower_zero_prologue(self, s: Any) -> None:
+        ctx = self.ctx
+        base_addr, _ = ctx.get_var(s.dst)
+        lbl_skip = ctx.new_label("ZP_SKIP")
+        p_cta = ctx.alloc_pred()
+        r_ctaid = ctx.alloc_u32()
+        ctx.emit(f"mov.u32 {r_ctaid}, %ctaid.x;")
+        ctx.emit(f"setp.ne.s32 {p_cta}, {r_ctaid}, 0;")
+        ctx.emit(f"@{p_cta} bra {lbl_skip};")
+
+        r_zi = ctx.alloc_u32()
+        ctx.emit(f"mov.u32 {r_zi}, %tid.x;")
+        lbl_loop = ctx.new_label("ZP_LOOP")
+        lbl_end = ctx.new_label("ZP_END")
+        ctx.emit_label(lbl_loop)
+
+        p_exit = ctx.alloc_pred()
+        ctx.emit(f"setp.ge.s32 {p_exit}, {r_zi}, {s.words};")
+        ctx.emit(f"@{p_exit} bra {lbl_end};")
+
+        addr = ctx.alloc_u64()
+        ctx.emit(f"mad.wide.s32 {addr}, {r_zi}, 4, {base_addr};")
+        ctx.emit(f"st.global.u32 [{addr}], 0;")
+
+        r_ntid = ctx.alloc_u32()
+        ctx.emit(f"mov.u32 {r_ntid}, %ntid.x;")
+        ctx.emit(f"add.s32 {r_zi}, {r_zi}, {r_ntid};")
+        ctx.emit(f"bra {lbl_loop};")
+        ctx.emit_label(lbl_end)
+        ctx.emit_label(lbl_skip)
 
     def _lower_cp_async_copy(self, s: Any) -> None:
         ctx = self.ctx
@@ -481,6 +543,8 @@ class StmtLowerer:
             "Smem": lambda _: None,
             "WarpShuffle": self._lower_warp_shuffle,
             "TreeHalve": self._lower_tree_halve,
+            "Select": self._lower_select,
+            "ZeroPrologue": self._lower_zero_prologue,
             "CpAsyncCopy": self._lower_cp_async_copy,
             "CpAsyncCommit": lambda _: self.ctx.emit("cp.async.commit_group;"),
             "CpAsyncWait": lambda stmt: self.ctx.emit(f"cp.async.wait_group {stmt.group};"),

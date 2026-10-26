@@ -15,7 +15,7 @@ class CodegenContext:
         self.label_seq: int = 0
 
         self.var_map: dict[str, tuple[str, str]] = {}
-        self.smem_decls: list[str] = []
+        self.buffer_shapes: dict[str, list[int]] = {}
 
     def alloc_pred(self) -> str:
         self.num_preds += 1
