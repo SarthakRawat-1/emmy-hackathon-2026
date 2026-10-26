@@ -210,6 +210,13 @@ class StmtLowerer:
             dst = self._assign_dst(s)
             ctx.emit(f"neg.f32 {dst}, {arg_regs[0]};")
             ctx.bind_var(s.name, dst, "f32")
+        elif op_name == "log":
+            dst = self._assign_dst(s)
+            t = ctx.alloc_f32()
+            # lg2.approx computes log2(x); multiply by ln(2) (0f3f317218) for natural log
+            ctx.emit(f"lg2.approx.f32 {t}, {arg_regs[0]};")
+            ctx.emit(f"mul.f32 {dst}, {t}, 0f3f317218;")
+            ctx.bind_var(s.name, dst, "f32")
         elif op_name == "relu":
             dst = self._assign_dst(s)
             ctx.emit(f"max.f32 {dst}, {arg_regs[0]}, 0f00000000;")
