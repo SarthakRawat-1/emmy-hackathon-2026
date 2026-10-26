@@ -10,9 +10,9 @@ class StmtLowerer:
     IDENTITY_MAP = {
         "add": 0.0,
         "sum": 0.0,
-        "maximum": -1e30,
+        "maximum": -1e30,  # practical -inf identity for float max
         "amax": -1e30,
-        "minimum": 1e30,
+        "minimum": 1e30,   # practical +inf identity for float min
         "multiply": 1.0,
         "prod": 1.0,
     }
@@ -134,11 +134,11 @@ class StmtLowerer:
             "int": ("s32", 4),
             "u32": ("u32", 4),
             "uint32": ("u32", 4),
-            "f16": ("b16", 2),
-            "float16": ("b16", 2),
-            "half": ("b16", 2),
-            "bf16": ("b16", 2),
-            "bfloat16": ("b16", 2),
+            "f16": ("f16", 2),
+            "float16": ("f16", 2),
+            "half": ("f16", 2),
+            "bf16": ("bf16", 2),
+            "bfloat16": ("bf16", 2),
             "s64": ("s64", 8),
             "int64": ("s64", 8),
             "u64": ("u64", 8),
@@ -253,7 +253,7 @@ class StmtLowerer:
         addr = self._get_smem_addr(s.input, flat_idx) if is_smem else self._get_buffer_addr(s.input, flat_idx)
 
         width = len(s.names)
-        if ptx_dt == "b16":
+        if ptx_dt == "f16":
             if width == 1:
                 r16 = ctx.alloc_u32()
                 ctx.emit(f"ld.{space}.b16 {r16}, [{addr}];")
@@ -267,6 +267,28 @@ class StmtLowerer:
                 for name, r in zip(s.names, r16s):
                     f32_dst = ctx.alloc_f32()
                     ctx.emit(f"cvt.f32.f16 {f32_dst}, {r};")
+                    ctx.bind_var(name, f32_dst, "f32")
+            else:
+                raise NotImplementedError(f"unsupported load width: {width}")
+            return
+        if ptx_dt == "bf16":
+            if width == 1:
+                r16 = ctx.alloc_u32()
+                ctx.emit(f"ld.{space}.b16 {r16}, [{addr}];")
+                f32_dst = ctx.alloc_f32()
+                r32 = ctx.alloc_u32()
+                ctx.emit(f"shl.b32 {r32}, {r16}, 16;")
+                ctx.emit(f"mov.b32 {f32_dst}, {r32};")
+                ctx.bind_var(s.names[0], f32_dst, "f32")
+            elif width in (2, 4):
+                r16s = [ctx.alloc_u32() for _ in range(width)]
+                vec = f"{{{', '.join(r16s)}}}"
+                ctx.emit(f"ld.{space}.v{width}.b16 {vec}, [{addr}];")
+                for name, r in zip(s.names, r16s):
+                    f32_dst = ctx.alloc_f32()
+                    r32 = ctx.alloc_u32()
+                    ctx.emit(f"shl.b32 {r32}, {r}, 16;")
+                    ctx.emit(f"mov.b32 {f32_dst}, {r32};")
                     ctx.bind_var(name, f32_dst, "f32")
             else:
                 raise NotImplementedError(f"unsupported load width: {width}")
@@ -308,11 +330,25 @@ class StmtLowerer:
             return
 
         width = len(val_regs)
-        if ptx_dt == "b16":
+        if ptx_dt == "f16":
             r16s = []
             for vr in val_regs:
                 r16 = ctx.alloc_u32()
                 ctx.emit(f"cvt.rn.f16.f32 {r16}, {vr};")
+                r16s.append(r16)
+            if width == 1:
+                ctx.emit(f"st.{space}.b16 [{addr}], {r16s[0]};")
+            elif width in (2, 4):
+                vec = f"{{{', '.join(r16s)}}}"
+                ctx.emit(f"st.{space}.v{width}.b16 [{addr}], {vec};")
+            else:
+                raise NotImplementedError(f"unsupported write width: {width}")
+            return
+        if ptx_dt == "bf16":
+            r16s = []
+            for vr in val_regs:
+                r16 = ctx.alloc_u32()
+                ctx.emit(f"cvt.rn.bf16.f32 {r16}, {vr};")
                 r16s.append(r16)
             if width == 1:
                 ctx.emit(f"st.{space}.b16 [{addr}], {r16s[0]};")
@@ -442,14 +478,10 @@ class StmtLowerer:
 
     def _lower_tree_halve(self, s: Any) -> None:
         ctx = self.ctx
+        if s.inner is not None:
+            raise NotImplementedError(f"TreeHalve.inner={s.inner!r} (segmented tree)")
         tid_reg, _ = ctx.get_var(s.tid_var)
         cur = s.length
-
-        inner_scale = None
-        inner_reg = None
-        if s.inner is not None:
-            iv_name, inner_scale = s.inner
-            inner_reg, _ = ctx.get_var(iv_name)
 
         while cur > 1:
             stride = (cur + 1) // 2
@@ -462,18 +494,9 @@ class StmtLowerer:
             partner_tid = ctx.alloc_u32()
             ctx.emit(f"add.s32 {partner_tid}, {tid_reg}, {stride};")
 
-            if inner_reg is not None and inner_scale is not None:
-                slot_self = ctx.alloc_u32()
-                slot_partner = ctx.alloc_u32()
-                ctx.emit(f"mad.lo.s32 {slot_self}, {tid_reg}, {inner_scale}, {inner_reg};")
-                ctx.emit(f"mad.lo.s32 {slot_partner}, {partner_tid}, {inner_scale}, {inner_reg};")
-            else:
-                slot_self = tid_reg
-                slot_partner = partner_tid
-
             for buf_name, s_name, sb_name in zip(s.bufs, s.state, s.state_b):
-                addr_self = self._get_smem_addr(buf_name, slot_self)
-                addr_partner = self._get_smem_addr(buf_name, slot_partner)
+                addr_self = self._get_smem_addr(buf_name, tid_reg)
+                addr_partner = self._get_smem_addr(buf_name, partner_tid)
 
                 reg_self = ctx.alloc_f32()
                 reg_partner = ctx.alloc_f32()
@@ -486,7 +509,7 @@ class StmtLowerer:
             self.lower_statements(s.combine_states)
 
             for buf_name, s_name in zip(s.bufs, s.state):
-                addr_self = self._get_smem_addr(buf_name, slot_self)
+                addr_self = self._get_smem_addr(buf_name, tid_reg)
                 res_reg, _ = ctx.get_var(s_name)
                 ctx.emit(f"st.shared.f32 [{addr_self}], {res_reg};")
 
@@ -494,17 +517,12 @@ class StmtLowerer:
             self._emit_barrier(s.barrier_id, s.barrier_count, False)
             cur = stride
 
-        if inner_reg is not None:
-            root_slot = inner_reg
-        else:
-            zero_reg = ctx.alloc_u32()
-            ctx.emit(f"mov.u32 {zero_reg}, 0;")
-            root_slot = zero_reg
-
+        zero_reg = ctx.alloc_u32()
+        ctx.emit(f"mov.u32 {zero_reg}, 0;")
         for buf_name, s_name in zip(s.bufs, s.state):
-            addr_root = self._get_smem_addr(buf_name, root_slot)
+            addr_zero = self._get_smem_addr(buf_name, zero_reg)
             bcast_reg = ctx.alloc_f32()
-            ctx.emit(f"ld.shared.f32 {bcast_reg}, [{addr_root}];")
+            ctx.emit(f"ld.shared.f32 {bcast_reg}, [{addr_zero}];")
             ctx.bind_var(s_name, bcast_reg, "f32")
         self._emit_barrier(s.barrier_id, s.barrier_count, False)
 
