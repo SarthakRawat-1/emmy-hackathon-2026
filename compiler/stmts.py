@@ -122,15 +122,27 @@ class StmtLowerer:
             self.ctx.emit(f"bar.sync {barrier_id}, {count};")
 
     @staticmethod
-    def _require_f32(dtype: Any, what: str) -> None:
-        name = getattr(dtype, "name", dtype)
-        if name not in (None, "f32", "float"):
-            raise NotImplementedError(f"{what}: dtype {name!r} (only f32)")
-
-    @staticmethod
-    def _require_no_swizzle(swizzle: Any, what: str) -> None:
-        if str(swizzle) not in ("NONE", "None", "SwizzleKind.NONE"):
-            raise NotImplementedError(f"{what}: swizzle {swizzle!r}")
+    def _resolve_dtype(dtype: Any) -> tuple[str, int]:
+        dt_str = getattr(dtype, "name", str(dtype) if dtype is not None else "f32")
+        dtype_map = {
+            "f32": ("f32", 4),
+            "float": ("f32", 4),
+            "float32": ("f32", 4),
+            "s32": ("s32", 4),
+            "int32": ("s32", 4),
+            "int": ("s32", 4),
+            "u32": ("u32", 4),
+            "uint32": ("u32", 4),
+            "f16": ("b16", 2),
+            "float16": ("b16", 2),
+            "half": ("b16", 2),
+            "bf16": ("b16", 2),
+            "bfloat16": ("b16", 2),
+            "s64": ("s64", 8),
+            "int64": ("s64", 8),
+            "u64": ("u64", 8),
+        }
+        return dtype_map.get(dt_str.lower(), ("f32", 4))
 
     def _lower_init(self, s: Any) -> None:
         ctx = self.ctx
@@ -247,7 +259,7 @@ class StmtLowerer:
 
     def _lower_load(self, s: Any) -> None:
         ctx = self.ctx
-        self._require_f32(s.dtype, f"Load {s.input}")
+        ptx_dt, elem_bytes = self._resolve_dtype(s.dtype)
         is_smem = s.input in self.smem_shapes
         shape = self.smem_shapes[s.input] if is_smem else self.buffer_shapes[s.input]
         flat_idx = self._calc_flat_index(s.index, shape)
@@ -257,22 +269,21 @@ class StmtLowerer:
 
         width = len(s.names)
         if width == 1:
-            dst = ctx.alloc_f32()
-            ctx.emit(f"ld.{space}.f32 {dst}, [{addr}];")
-            ctx.bind_var(s.names[0], dst, "f32")
+            dst = ctx.alloc_typed(ptx_dt)
+            ctx.emit(f"ld.{space}.{ptx_dt} {dst}, [{addr}];")
+            ctx.bind_var(s.names[0], dst, ptx_dt)
         elif width in (2, 4):
-            dsts = [ctx.alloc_f32() for _ in range(width)]
+            dsts = [ctx.alloc_typed(ptx_dt) for _ in range(width)]
             vec = f"{{{', '.join(dsts)}}}"
-            ctx.emit(f"ld.{space}.v{width}.f32 {vec}, [{addr}];")
+            ctx.emit(f"ld.{space}.v{width}.{ptx_dt} {vec}, [{addr}];")
             for name, d in zip(s.names, dsts):
-                ctx.bind_var(name, d, "f32")
+                ctx.bind_var(name, d, ptx_dt)
         else:
             raise NotImplementedError(f"unsupported load width: {width}")
 
     def _lower_write(self, s: Any) -> None:
         ctx = self.ctx
-        self._require_f32(s.value_dtype, f"Write {s.output}")
-        self._require_no_swizzle(s.swizzle, f"Write {s.output}")
+        ptx_dt, elem_bytes = self._resolve_dtype(s.value_dtype)
         is_smem = s.output in self.smem_shapes
         shape = self.smem_shapes[s.output] if is_smem else self.buffer_shapes[s.output]
         flat_idx = self._calc_flat_index(s.index, shape)
@@ -294,10 +305,10 @@ class StmtLowerer:
 
         width = len(val_regs)
         if width == 1:
-            ctx.emit(f"st.{space}.f32 [{addr}], {val_regs[0]};")
+            ctx.emit(f"st.{space}.{ptx_dt} [{addr}], {val_regs[0]};")
         elif width in (2, 4):
             vec = f"{{{', '.join(val_regs)}}}"
-            ctx.emit(f"st.{space}.v{width}.f32 [{addr}], {vec};")
+            ctx.emit(f"st.{space}.v{width}.{ptx_dt} [{addr}], {vec};")
         else:
             raise NotImplementedError(f"unsupported write width: {width}")
 
@@ -461,7 +472,6 @@ class StmtLowerer:
 
     def _lower_cp_async_copy(self, s: Any) -> None:
         ctx = self.ctx
-        self._require_no_swizzle(s.swizzle, f"CpAsyncCopy {s.smem}")
         src_shape = self.buffer_shapes[s.src]
         src_flat = self._calc_flat_index(s.src_index, src_shape)
         src_addr = self._get_buffer_addr(s.src, src_flat)
