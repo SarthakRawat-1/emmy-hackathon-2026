@@ -157,6 +157,25 @@ class StmtLowerer:
         reg, dtype = lower_expr(self.ctx, s.value)
         self.ctx.bind_var(s.name, reg, dtype)
 
+    UNARY_OPS = {
+        "copy": "mov.f32",
+        "reciprocal": "rcp.rn.f32",
+        "sqrt": "sqrt.rn.f32",
+        "rsqrt": "rsqrt.approx.f32",
+        "abs": "abs.f32",
+        "negative": "neg.f32",
+        "neg": "neg.f32",
+    }
+
+    BINARY_OPS = {
+        "add": "add.f32",
+        "subtract": "sub.f32",
+        "multiply": "mul.f32",
+        "divide": "div.rn.f32",
+        "maximum": "max.f32",
+        "minimum": "min.f32",
+    }
+
     def _assign_dst(self, s: Any) -> str:
         if s.name in self.init_vars and s.name in self.ctx.var_map:
             return self.ctx.get_var(s.name)[0]
@@ -166,75 +185,28 @@ class StmtLowerer:
         ctx = self.ctx
         op_name = getattr(s.op, "name", str(s.op))
         arg_regs = [ctx.get_var(a)[0] for a in s.args]
+        dst = self._assign_dst(s)
 
-        if op_name == "copy":
-            dst = self._assign_dst(s)
-            ctx.emit(f"mov.f32 {dst}, {arg_regs[0]};")
-            ctx.bind_var(s.name, dst, "f32")
-        elif op_name == "add":
-            dst = self._assign_dst(s)
-            ctx.emit(f"add.f32 {dst}, {arg_regs[0]}, {arg_regs[1]};")
-            ctx.bind_var(s.name, dst, "f32")
-        elif op_name == "subtract":
-            dst = self._assign_dst(s)
-            ctx.emit(f"sub.f32 {dst}, {arg_regs[0]}, {arg_regs[1]};")
-            ctx.bind_var(s.name, dst, "f32")
-        elif op_name == "multiply":
-            dst = self._assign_dst(s)
-            ctx.emit(f"mul.f32 {dst}, {arg_regs[0]}, {arg_regs[1]};")
-            ctx.bind_var(s.name, dst, "f32")
-        elif op_name == "divide":
-            dst = self._assign_dst(s)
-            ctx.emit(f"div.rn.f32 {dst}, {arg_regs[0]}, {arg_regs[1]};")
-            ctx.bind_var(s.name, dst, "f32")
-        elif op_name == "reciprocal":
-            dst = self._assign_dst(s)
-            ctx.emit(f"rcp.rn.f32 {dst}, {arg_regs[0]};")
-            ctx.bind_var(s.name, dst, "f32")
-        elif op_name == "sqrt":
-            dst = self._assign_dst(s)
-            ctx.emit(f"sqrt.rn.f32 {dst}, {arg_regs[0]};")
-            ctx.bind_var(s.name, dst, "f32")
-        elif op_name == "rsqrt":
-            dst = self._assign_dst(s)
-            ctx.emit(f"rsqrt.approx.f32 {dst}, {arg_regs[0]};")
-            ctx.bind_var(s.name, dst, "f32")
+        if op_name in self.UNARY_OPS:
+            ctx.emit(f"{self.UNARY_OPS[op_name]} {dst}, {arg_regs[0]};")
+        elif op_name in self.BINARY_OPS:
+            ctx.emit(f"{self.BINARY_OPS[op_name]} {dst}, {arg_regs[0]}, {arg_regs[1]};")
         elif op_name in ("exp", "exp_fast"):
-            dst = self._assign_dst(s)
             t = ctx.alloc_f32()
             # 0f3fb8aa3b is log2(e)
             ctx.emit(f"mul.f32 {t}, {arg_regs[0]}, 0f3fb8aa3b;")
             ctx.emit(f"ex2.approx.f32 {dst}, {t};")
-            ctx.bind_var(s.name, dst, "f32")
-        elif op_name == "maximum":
-            dst = self._assign_dst(s)
-            ctx.emit(f"max.f32 {dst}, {arg_regs[0]}, {arg_regs[1]};")
-            ctx.bind_var(s.name, dst, "f32")
-        elif op_name == "minimum":
-            dst = self._assign_dst(s)
-            ctx.emit(f"min.f32 {dst}, {arg_regs[0]}, {arg_regs[1]};")
-            ctx.bind_var(s.name, dst, "f32")
-        elif op_name == "abs":
-            dst = self._assign_dst(s)
-            ctx.emit(f"abs.f32 {dst}, {arg_regs[0]};")
-            ctx.bind_var(s.name, dst, "f32")
-        elif op_name in ("negative", "neg"):
-            dst = self._assign_dst(s)
-            ctx.emit(f"neg.f32 {dst}, {arg_regs[0]};")
-            ctx.bind_var(s.name, dst, "f32")
         elif op_name == "log":
-            dst = self._assign_dst(s)
             t = ctx.alloc_f32()
             # lg2.approx computes log2(x); multiply by ln(2) (0f3f317218) for natural log
             ctx.emit(f"lg2.approx.f32 {t}, {arg_regs[0]};")
             ctx.emit(f"mul.f32 {dst}, {t}, 0f3f317218;")
-            ctx.bind_var(s.name, dst, "f32")
         elif op_name == "relu":
-            dst = self._assign_dst(s)
             ctx.emit(f"max.f32 {dst}, {arg_regs[0]}, 0f00000000;")
-            ctx.bind_var(s.name, dst, "f32")
         else:
             raise NotImplementedError(f"unsupported assign op: {op_name}")
+
+        ctx.bind_var(s.name, dst, "f32")
 
     def _lower_accum(self, s: Any) -> None:
         ctx = self.ctx
