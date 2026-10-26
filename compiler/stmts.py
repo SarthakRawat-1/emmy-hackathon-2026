@@ -180,6 +180,16 @@ class StmtLowerer:
         "minimum": "min.f32",
     }
 
+    ACCUM_OPS = {
+        "add": "add.f32",
+        "sum": "add.f32",
+        "maximum": "max.f32",
+        "amax": "max.f32",
+        "minimum": "min.f32",
+        "multiply": "mul.f32",
+        "prod": "mul.f32",
+    }
+
     def _assign_dst(self, s: Any) -> str:
         if s.name in self.init_vars and s.name in self.ctx.var_map:
             return self.ctx.get_var(s.name)[0]
@@ -228,16 +238,9 @@ class StmtLowerer:
             acc_reg = ctx.alloc_f32()
             ctx.bind_var(s.name, acc_reg, "f32")
 
-        if op_name in ("add", "sum"):
-            ctx.emit(f"add.f32 {acc_reg}, {lhs_reg}, {val_reg};")
-        elif op_name in ("maximum", "amax"):
-            ctx.emit(f"max.f32 {acc_reg}, {lhs_reg}, {val_reg};")
-        elif op_name == "minimum":
-            ctx.emit(f"min.f32 {acc_reg}, {lhs_reg}, {val_reg};")
-        elif op_name in ("multiply", "prod"):
-            ctx.emit(f"mul.f32 {acc_reg}, {lhs_reg}, {val_reg};")
-        else:
+        if op_name not in self.ACCUM_OPS:
             raise NotImplementedError(f"unsupported accum op: {op_name}")
+        ctx.emit(f"{self.ACCUM_OPS[op_name]} {acc_reg}, {lhs_reg}, {val_reg};")
 
     def _lower_load(self, s: Any) -> None:
         ctx = self.ctx
