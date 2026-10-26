@@ -10,6 +10,39 @@ def float_to_ptx_hex(val: float) -> str:
     return f"0f{b.hex()}"
 
 
+def calc_flat_index(ctx: CodegenContext, indices: tuple[Any, ...], shape: list[int]) -> str:
+    if not indices:
+        r = ctx.alloc_u32()
+        ctx.emit(f"mov.u32 {r}, 0;")
+        return r
+
+    strides = [1] * len(shape)
+    for i in range(len(shape) - 2, -1, -1):
+        strides[i] = strides[i + 1] * shape[i + 1]
+
+    flat_terms: list[str] = []
+    for idx_expr, stride in zip(indices, strides):
+        idx_reg, _ = lower_expr(ctx, idx_expr)
+        if stride == 1:
+            flat_terms.append(idx_reg)
+        else:
+            s_reg = ctx.alloc_u32()
+            ctx.emit(f"mul.lo.s32 {s_reg}, {idx_reg}, {stride};")
+            flat_terms.append(s_reg)
+
+    if not flat_terms:
+        r = ctx.alloc_u32()
+        ctx.emit(f"mov.u32 {r}, 0;")
+        return r
+
+    cur = flat_terms[0]
+    for next_term in flat_terms[1:]:
+        dst = ctx.alloc_u32()
+        ctx.emit(f"add.s32 {dst}, {cur}, {next_term};")
+        cur = dst
+    return cur
+
+
 def lower_expr(ctx: CodegenContext, e: expr.Expr) -> tuple[str, str]:
     if isinstance(e, expr.Var):
         return ctx.get_var(e.name)
@@ -29,6 +62,16 @@ def lower_expr(ctx: CodegenContext, e: expr.Expr) -> tuple[str, str]:
 
         is_float = (l_type == "f32" or r_type == "f32")
         ptx_type = "f32" if is_float else "s32"
+
+        if is_float:
+            if l_type != "f32":
+                pf = ctx.alloc_f32()
+                ctx.emit(f"cvt.rn.f32.s32 {pf}, {l_reg};")
+                l_reg = pf
+            if r_type != "f32":
+                pf = ctx.alloc_f32()
+                ctx.emit(f"cvt.rn.f32.s32 {pf}, {r_reg};")
+                r_reg = pf
 
         if e.op == "+":
             dst = ctx.alloc_f32() if is_float else ctx.alloc_u32()
@@ -60,7 +103,7 @@ def lower_expr(ctx: CodegenContext, e: expr.Expr) -> tuple[str, str]:
                 ">": "gt",
                 ">=": "ge",
                 "==": "eq",
-                "!=": "ne",
+                "!=": "neu" if is_float else "ne",
             }
             ctx.emit(f"setp.{cmp_map[e.op]}.{ptx_type} {dst}, {l_reg}, {r_reg};")
             return dst, "pred"
@@ -163,28 +206,8 @@ def lower_expr(ctx: CodegenContext, e: expr.Expr) -> tuple[str, str]:
 
     if isinstance(e, expr.FlatIndex):
         shape = ctx.buffer_shapes.get(e.buffer, [1])
-        strides = [1] * len(shape)
-        for i in range(len(shape) - 2, -1, -1):
-            strides[i] = strides[i + 1] * shape[i + 1]
-        flat_terms: list[str] = []
-        for idx_expr, stride in zip(e.index, strides):
-            idx_reg, _ = lower_expr(ctx, idx_expr)
-            if stride == 1:
-                flat_terms.append(idx_reg)
-            else:
-                s_reg = ctx.alloc_u32()
-                ctx.emit(f"mul.lo.s32 {s_reg}, {idx_reg}, {stride};")
-                flat_terms.append(s_reg)
-        if not flat_terms:
-            r = ctx.alloc_u32()
-            ctx.emit(f"mov.u32 {r}, 0;")
-            return r, "s32"
-        cur = flat_terms[0]
-        for next_term in flat_terms[1:]:
-            dst = ctx.alloc_u32()
-            ctx.emit(f"add.s32 {dst}, {cur}, {next_term};")
-            cur = dst
-        return cur, "s32"
+        r = calc_flat_index(ctx, e.index, shape)
+        return r, "s32"
 
     if isinstance(e, expr.FuncCallExpr):
         arg_regs = []

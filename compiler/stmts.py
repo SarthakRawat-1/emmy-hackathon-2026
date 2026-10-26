@@ -3,10 +3,20 @@ from __future__ import annotations
 from typing import Any
 import emmy.compiler.ir.expr as expr
 from .context import CodegenContext
-from .expr import lower_expr, float_to_ptx_hex
+from .expr import lower_expr, float_to_ptx_hex, calc_flat_index
 
 
 class StmtLowerer:
+    IDENTITY_MAP = {
+        "add": 0.0,
+        "sum": 0.0,
+        "maximum": -1e30,
+        "amax": -1e30,
+        "minimum": 1e30,
+        "multiply": 1.0,
+        "prod": 1.0,
+    }
+
     def __init__(
         self,
         ctx: CodegenContext,
@@ -23,6 +33,26 @@ class StmtLowerer:
         self.dynamic_smem = dynamic_smem
         self.buffer_elem_bytes = buffer_elem_bytes or {}
         self.init_vars: set[str] = set()
+        self.handlers = {
+            "Init": self._lower_init,
+            "Let": self._lower_let,
+            "Assign": self._lower_assign,
+            "Accum": self._lower_accum,
+            "Load": self._lower_load,
+            "Write": self._lower_write,
+            "StridedLoop": self._lower_strided_loop,
+            "Loop": self._lower_loop,
+            "Cond": self._lower_cond,
+            "Sync": lambda st: self._emit_barrier(st.barrier_id, st.count, st.warp),
+            "Smem": lambda _: None,
+            "WarpShuffle": self._lower_warp_shuffle,
+            "TreeHalve": self._lower_tree_halve,
+            "Select": self._lower_select,
+            "ZeroPrologue": self._lower_zero_prologue,
+            "CpAsyncCopy": self._lower_cp_async_copy,
+            "CpAsyncCommit": lambda _: self.ctx.emit("cp.async.commit_group;"),
+            "CpAsyncWait": lambda stmt: self.ctx.emit(f"cp.async.wait_group {stmt.group};"),
+        }
 
     def _init_accumulators_for_axis(self, axis_name: str, body: Any) -> None:
         ctx = self.ctx
@@ -39,10 +69,8 @@ class StmtLowerer:
                         reg, _ = ctx.get_var(s.name)
 
                     op_name = getattr(s.op, "name", str(s.op))
-                    if op_name == "maximum":
-                        ctx.emit(f"mov.f32 {reg}, {float_to_ptx_hex(-1e30)};")
-                    else:
-                        ctx.emit(f"mov.f32 {reg}, 0f00000000;")
+                    identity_val = self.IDENTITY_MAP.get(op_name, 0.0)
+                    ctx.emit(f"mov.f32 {reg}, {float_to_ptx_hex(identity_val)};")
             if hasattr(s, "body") and s.body:
                 self._init_accumulators_for_axis(axis_name, s.body)
 
@@ -54,37 +82,7 @@ class StmtLowerer:
             self.lower_statement(s)
 
     def _calc_flat_index(self, indices: tuple[Any, ...], shape: list[int]) -> str:
-        ctx = self.ctx
-        if not indices:
-            r = ctx.alloc_u32()
-            ctx.emit(f"mov.u32 {r}, 0;")
-            return r
-
-        strides = [1] * len(shape)
-        for i in range(len(shape) - 2, -1, -1):
-            strides[i] = strides[i + 1] * shape[i + 1]
-
-        flat_terms: list[str] = []
-        for idx_expr, stride in zip(indices, strides):
-            idx_reg, _ = lower_expr(ctx, idx_expr)
-            if stride == 1:
-                flat_terms.append(idx_reg)
-            else:
-                s_reg = ctx.alloc_u32()
-                ctx.emit(f"mul.lo.s32 {s_reg}, {idx_reg}, {stride};")
-                flat_terms.append(s_reg)
-
-        if not flat_terms:
-            r = ctx.alloc_u32()
-            ctx.emit(f"mov.u32 {r}, 0;")
-            return r
-
-        cur = flat_terms[0]
-        for next_term in flat_terms[1:]:
-            dst = ctx.alloc_u32()
-            ctx.emit(f"add.s32 {dst}, {cur}, {next_term};")
-            cur = dst
-        return cur
+        return calc_flat_index(self.ctx, indices, shape)
 
     def _get_buffer_addr(self, buf_name: str, flat_idx_reg: str) -> str:
         ctx = self.ctx
@@ -230,10 +228,14 @@ class StmtLowerer:
             acc_reg = ctx.alloc_f32()
             ctx.bind_var(s.name, acc_reg, "f32")
 
-        if op_name == "add":
+        if op_name in ("add", "sum"):
             ctx.emit(f"add.f32 {acc_reg}, {lhs_reg}, {val_reg};")
-        elif op_name == "maximum":
+        elif op_name in ("maximum", "amax"):
             ctx.emit(f"max.f32 {acc_reg}, {lhs_reg}, {val_reg};")
+        elif op_name == "minimum":
+            ctx.emit(f"min.f32 {acc_reg}, {lhs_reg}, {val_reg};")
+        elif op_name in ("multiply", "prod"):
+            ctx.emit(f"mul.f32 {acc_reg}, {lhs_reg}, {val_reg};")
         else:
             raise NotImplementedError(f"unsupported accum op: {op_name}")
 
@@ -248,6 +250,25 @@ class StmtLowerer:
         addr = self._get_smem_addr(s.input, flat_idx) if is_smem else self._get_buffer_addr(s.input, flat_idx)
 
         width = len(s.names)
+        if ptx_dt == "b16":
+            if width == 1:
+                r16 = ctx.alloc_u32()
+                ctx.emit(f"ld.{space}.b16 {r16}, [{addr}];")
+                f32_dst = ctx.alloc_f32()
+                ctx.emit(f"cvt.f32.f16 {f32_dst}, {r16};")
+                ctx.bind_var(s.names[0], f32_dst, "f32")
+            elif width in (2, 4):
+                r16s = [ctx.alloc_u32() for _ in range(width)]
+                vec = f"{{{', '.join(r16s)}}}"
+                ctx.emit(f"ld.{space}.v{width}.b16 {vec}, [{addr}];")
+                for name, r in zip(s.names, r16s):
+                    f32_dst = ctx.alloc_f32()
+                    ctx.emit(f"cvt.f32.f16 {f32_dst}, {r};")
+                    ctx.bind_var(name, f32_dst, "f32")
+            else:
+                raise NotImplementedError(f"unsupported load width: {width}")
+            return
+
         if width == 1:
             dst = ctx.alloc_typed(ptx_dt)
             ctx.emit(f"ld.{space}.{ptx_dt} {dst}, [{addr}];")
@@ -281,6 +302,22 @@ class StmtLowerer:
 
         if not is_smem and getattr(s, "atomic", False):
             ctx.emit(f"red.global.add.f32 [{addr}], {val_regs[0]};")
+            return
+
+        width = len(val_regs)
+        if ptx_dt == "b16":
+            r16s = []
+            for vr in val_regs:
+                r16 = ctx.alloc_u32()
+                ctx.emit(f"cvt.rn.f16.f32 {r16}, {vr};")
+                r16s.append(r16)
+            if width == 1:
+                ctx.emit(f"st.{space}.b16 [{addr}], {r16s[0]};")
+            elif width in (2, 4):
+                vec = f"{{{', '.join(r16s)}}}"
+                ctx.emit(f"st.{space}.v{width}.b16 [{addr}], {vec};")
+            else:
+                raise NotImplementedError(f"unsupported write width: {width}")
             return
 
         width = len(val_regs)
@@ -529,28 +566,7 @@ class StmtLowerer:
 
     def lower_statement(self, s: Any) -> None:
         s_type = type(s).__name__
-        handlers = {
-            "Init": self._lower_init,
-            "Let": self._lower_let,
-            "Assign": self._lower_assign,
-            "Accum": self._lower_accum,
-            "Load": self._lower_load,
-            "Write": self._lower_write,
-            "StridedLoop": self._lower_strided_loop,
-            "Loop": self._lower_loop,
-            "Cond": self._lower_cond,
-            "Sync": lambda st: self._emit_barrier(st.barrier_id, st.count, st.warp),
-            "Smem": lambda _: None,
-            "WarpShuffle": self._lower_warp_shuffle,
-            "TreeHalve": self._lower_tree_halve,
-            "Select": self._lower_select,
-            "ZeroPrologue": self._lower_zero_prologue,
-            "CpAsyncCopy": self._lower_cp_async_copy,
-            "CpAsyncCommit": lambda _: self.ctx.emit("cp.async.commit_group;"),
-            "CpAsyncWait": lambda stmt: self.ctx.emit(f"cp.async.wait_group {stmt.group};"),
-        }
-
-        handler = handlers.get(s_type)
+        handler = self.handlers.get(s_type)
         if handler is None:
             raise NotImplementedError(f"unsupported statement type: {s_type}")
         handler(s)
