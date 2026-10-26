@@ -86,6 +86,23 @@ def lower_expr(ctx: CodegenContext, e: expr.Expr) -> tuple[str, str]:
             return dst, "s32"
         raise NotImplementedError(f"unsupported binary op: {e.op}")
 
+    if isinstance(e, expr.CastExpr):
+        src_reg, src_type = lower_expr(ctx, e.expr)
+        tgt_name = getattr(e.dtype, "name", str(e.dtype)).lower()
+        if tgt_name in ("f32", "float", "float32"):
+            if src_type == "f32":
+                return src_reg, "f32"
+            dst = ctx.alloc_f32()
+            ctx.emit(f"cvt.rn.f32.s32 {dst}, {src_reg};")
+            return dst, "f32"
+        if tgt_name in ("s32", "int32", "int", "i32"):
+            if src_type in ("s32", "u32"):
+                return src_reg, "s32"
+            dst = ctx.alloc_u32()
+            ctx.emit(f"cvt.rzi.s32.f32 {dst}, {src_reg};")
+            return dst, "s32"
+        return src_reg, src_type
+
     if isinstance(e, expr.TernaryExpr):
         cond_reg, cond_type = lower_expr(ctx, e.cond)
         if cond_type != "pred":

@@ -14,12 +14,14 @@ class StmtLowerer:
         smem_shapes: dict[str, list[int]],
         smem_offsets: dict[str, int],
         dynamic_smem: bool,
+        buffer_elem_bytes: dict[str, int] | None = None,
     ) -> None:
         self.ctx = ctx
         self.buffer_shapes = buffer_shapes
         self.smem_shapes = smem_shapes
         self.smem_offsets = smem_offsets
         self.dynamic_smem = dynamic_smem
+        self.buffer_elem_bytes = buffer_elem_bytes or {}
         self.init_vars: set[str] = set()
 
     def _init_accumulators_for_axis(self, axis_name: str, body: Any) -> None:
@@ -87,8 +89,9 @@ class StmtLowerer:
     def _get_buffer_addr(self, buf_name: str, flat_idx_reg: str) -> str:
         ctx = self.ctx
         base_reg, _ = ctx.get_var(buf_name)
+        elem_bytes = self.buffer_elem_bytes.get(buf_name, 4)
         addr_reg = ctx.alloc_u64()
-        ctx.emit(f"mad.wide.s32 {addr_reg}, {flat_idx_reg}, 4, {base_reg};")
+        ctx.emit(f"mad.wide.s32 {addr_reg}, {flat_idx_reg}, {elem_bytes}, {base_reg};")
         return addr_reg
 
     def _get_smem_addr(self, smem_name: str, flat_idx_reg: str) -> str:

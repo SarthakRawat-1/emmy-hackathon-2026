@@ -80,17 +80,25 @@ def resolve_kernel(g: Graph, ir_path: Path, meta: dict[str, Any] | None) -> Kern
     )
 
 
-def resolve_buffer_shapes(g: Graph, meta: dict[str, Any] | None) -> dict[str, list[int]]:
+def resolve_buffer_shapes(g: Graph, meta: dict[str, Any] | None) -> tuple[dict[str, list[int]], dict[str, int]]:
     shapes: dict[str, list[int]] = {}
+    elem_bytes: dict[str, int] = {}
+    dtype_sizes = {"f32": 4, "float": 4, "s32": 4, "int32": 4, "f16": 2, "bf16": 2, "s64": 8, "u64": 8}
+
     for _, node in g.nodes.items():
         if hasattr(node, "outputs"):
             for out in node.outputs:
                 shapes[out.name] = [to_int(d) for d in out.shape] if out.shape else [1]
+                dt = getattr(out.dtype, "name", str(out.dtype) if out.dtype else "f32")
+                elem_bytes[out.name] = dtype_sizes.get(dt.lower(), 4)
     if meta and "args" in meta:
         for a in meta["args"]:
-            if a["name"] not in shapes:
-                shapes[a["name"]] = [to_int(d) for d in a["shape"]] if a.get("shape") else [1]
-    return shapes
+            name = a["name"]
+            if name not in shapes:
+                shapes[name] = [to_int(d) for d in a["shape"]] if a.get("shape") else [1]
+            dt = a.get("dtype", "f32")
+            elem_bytes[name] = dtype_sizes.get(dt.lower(), 4)
+    return shapes, elem_bytes
 
 
 def resolve_shared_memory(tile: kir.Tile) -> tuple[dict[str, list[int]], dict[str, int], dict[str, int]]:
@@ -146,7 +154,18 @@ def emit_prologue(ctx: CodegenContext, desc: KernelDescriptor, tile: kir.Tile) -
     r_gid = ctx.alloc_u32()
 
     ctx.emit(f"mov.u32 {r_tid}, %tid.x;")
-    ctx.emit(f"mov.u32 {r_ctaid}, %ctaid.x;")
+    if len(desc.grid) > 1 and desc.grid[1] > 1:
+        # Multi-dimensional grid decomposition
+        r_cx = ctx.alloc_u32()
+        r_cy = ctx.alloc_u32()
+        r_nx = ctx.alloc_u32()
+        ctx.emit(f"mov.u32 {r_cx}, %ctaid.x;")
+        ctx.emit(f"mov.u32 {r_cy}, %ctaid.y;")
+        ctx.emit(f"mov.u32 {r_nx}, %nctaid.x;")
+        ctx.emit(f"mad.lo.u32 {r_ctaid}, {r_cy}, {r_nx}, {r_cx};")
+    else:
+        ctx.emit(f"mov.u32 {r_ctaid}, %ctaid.x;")
+
     ctx.emit(f"mov.u32 {r_ntid}, %ntid.x;")
     ctx.emit(f"mad.lo.u32 {r_gid}, {r_ctaid}, {r_ntid}, {r_tid};")
 
@@ -320,7 +339,7 @@ def main() -> None:
 
     meta = load_meta(ir_path)
     desc = resolve_kernel(g, ir_path, meta)
-    buffer_shapes = resolve_buffer_shapes(g, meta)
+    buffer_shapes, buffer_elem_bytes = resolve_buffer_shapes(g, meta)
 
     tile = None
     for b in desc.node.op.body:
@@ -339,7 +358,7 @@ def main() -> None:
     ctx = CodegenContext(desc.entry, desc.arg_order)
     lbl_exit = emit_prologue(ctx, desc, tile)
 
-    lowerer = StmtLowerer(ctx, buffer_shapes, smem_shapes, smem_offsets, dynamic_smem)
+    lowerer = StmtLowerer(ctx, buffer_shapes, smem_shapes, smem_offsets, dynamic_smem, buffer_elem_bytes)
     lowerer.lower_statements(tile.body)
 
     ctx.emit_label(lbl_exit)
