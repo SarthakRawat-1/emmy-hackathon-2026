@@ -2,19 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 import emmy.compiler.ir.expr as expr
-from .context import CodegenContext
-from .expr import lower_expr, float_to_ptx_hex, calc_flat_index
+from .context import CodegenContext, resolve_dtype_info
+from .expr import lower_expr, float_to_ptx_hex, calc_flat_index, as_f32
 
 
 class StmtLowerer:
-    IDENTITY_MAP = {
-        "add": 0.0,
-        "sum": 0.0,
-        "maximum": -1e30,  # practical -inf identity for float max
-        "amax": -1e30,
-        "minimum": 1e30,   # practical +inf identity for float min
-        "multiply": 1.0,
-        "prod": 1.0,
+    ACCUM_OPS = {
+        "add": ("add.f32", 0.0),
+        "maximum": ("max.f32", -1e30),  # practical -inf identity for float max
+        "minimum": ("min.f32", 1e30),    # practical +inf identity for float min
+        "multiply": ("mul.f32", 1.0),
     }
 
     def __init__(
@@ -69,7 +66,9 @@ class StmtLowerer:
                         reg, _ = ctx.get_var(s.name)
 
                     op_name = getattr(s.op, "name", str(s.op))
-                    identity_val = self.IDENTITY_MAP.get(op_name, 0.0)
+                    if op_name not in self.ACCUM_OPS:
+                        raise NotImplementedError(f"unsupported accum op: {op_name}")
+                    identity_val = self.ACCUM_OPS[op_name][1]
                     ctx.emit(f"mov.f32 {reg}, {float_to_ptx_hex(identity_val)};")
             if hasattr(s, "body") and s.body:
                 self._init_accumulators_for_axis(axis_name, s.body)
@@ -94,6 +93,7 @@ class StmtLowerer:
 
     def _get_smem_addr(self, smem_name: str, flat_idx_reg: str) -> str:
         ctx = self.ctx
+        # smem allocations in Kernel IR use 4-byte words
         byte_off = ctx.alloc_u32()
         ctx.emit(f"shl.b32 {byte_off}, {flat_idx_reg}, 2;")
 
@@ -124,26 +124,7 @@ class StmtLowerer:
 
     @staticmethod
     def _resolve_dtype(dtype: Any) -> tuple[str, int]:
-        dt_str = getattr(dtype, "name", str(dtype) if dtype is not None else "f32")
-        dtype_map = {
-            "f32": ("f32", 4),
-            "float": ("f32", 4),
-            "float32": ("f32", 4),
-            "s32": ("s32", 4),
-            "int32": ("s32", 4),
-            "int": ("s32", 4),
-            "u32": ("u32", 4),
-            "uint32": ("u32", 4),
-            "f16": ("f16", 2),
-            "float16": ("f16", 2),
-            "half": ("f16", 2),
-            "bf16": ("bf16", 2),
-            "bfloat16": ("bf16", 2),
-            "s64": ("s64", 8),
-            "int64": ("s64", 8),
-            "u64": ("u64", 8),
-        }
-        return dtype_map.get(dt_str.lower(), ("f32", 4))
+        return resolve_dtype_info(dtype)
 
     def _lower_init(self, s: Any) -> None:
         ctx = self.ctx
@@ -180,16 +161,6 @@ class StmtLowerer:
         "minimum": "min.f32",
     }
 
-    ACCUM_OPS = {
-        "add": "add.f32",
-        "sum": "add.f32",
-        "maximum": "max.f32",
-        "amax": "max.f32",
-        "minimum": "min.f32",
-        "multiply": "mul.f32",
-        "prod": "mul.f32",
-    }
-
     def _assign_dst(self, s: Any) -> str:
         if s.name in self.init_vars and s.name in self.ctx.var_map:
             return self.ctx.get_var(s.name)[0]
@@ -198,7 +169,7 @@ class StmtLowerer:
     def _lower_assign(self, s: Any) -> None:
         ctx = self.ctx
         op_name = getattr(s.op, "name", str(s.op))
-        arg_regs = [ctx.get_var(a)[0] for a in s.args]
+        arg_regs = [as_f32(ctx, *ctx.get_var(a)) for a in s.args]
         dst = self._assign_dst(s)
 
         if op_name in self.UNARY_OPS:
@@ -227,10 +198,12 @@ class StmtLowerer:
     def _lower_accum(self, s: Any) -> None:
         ctx = self.ctx
         op_name = getattr(s.op, "name", str(s.op))
-        val_reg, _ = ctx.get_var(s.value) if isinstance(s.value, str) else lower_expr(ctx, s.value)
+        val_reg, val_dt = ctx.get_var(s.value) if isinstance(s.value, str) else lower_expr(ctx, s.value)
+        val_reg = as_f32(ctx, val_reg, val_dt)
 
         lhs_name = s.base if s.base is not None else s.name
-        lhs_reg, _ = ctx.get_var(lhs_name) if isinstance(lhs_name, str) else lower_expr(ctx, lhs_name)
+        lhs_reg, lhs_dt = ctx.get_var(lhs_name) if isinstance(lhs_name, str) else lower_expr(ctx, lhs_name)
+        lhs_reg = as_f32(ctx, lhs_reg, lhs_dt)
 
         if s.name in ctx.var_map:
             acc_reg, _ = ctx.get_var(s.name)
@@ -240,7 +213,8 @@ class StmtLowerer:
 
         if op_name not in self.ACCUM_OPS:
             raise NotImplementedError(f"unsupported accum op: {op_name}")
-        ctx.emit(f"{self.ACCUM_OPS[op_name]} {acc_reg}, {lhs_reg}, {val_reg};")
+        ptx_op = self.ACCUM_OPS[op_name][0]
+        ctx.emit(f"{ptx_op} {acc_reg}, {lhs_reg}, {val_reg};")
 
     def _lower_load(self, s: Any) -> None:
         ctx = self.ctx
@@ -253,42 +227,21 @@ class StmtLowerer:
         addr = self._get_smem_addr(s.input, flat_idx) if is_smem else self._get_buffer_addr(s.input, flat_idx)
 
         width = len(s.names)
-        if ptx_dt == "f16":
+        if ptx_dt in ("f16", "bf16"):
+            cvt_op = f"cvt.f32.{ptx_dt}"
             if width == 1:
-                r16 = ctx.alloc_u32()
+                r16 = ctx.alloc_b16()
                 ctx.emit(f"ld.{space}.b16 {r16}, [{addr}];")
                 f32_dst = ctx.alloc_f32()
-                ctx.emit(f"cvt.f32.f16 {f32_dst}, {r16};")
+                ctx.emit(f"{cvt_op} {f32_dst}, {r16};")
                 ctx.bind_var(s.names[0], f32_dst, "f32")
             elif width in (2, 4):
-                r16s = [ctx.alloc_u32() for _ in range(width)]
+                r16s = [ctx.alloc_b16() for _ in range(width)]
                 vec = f"{{{', '.join(r16s)}}}"
                 ctx.emit(f"ld.{space}.v{width}.b16 {vec}, [{addr}];")
                 for name, r in zip(s.names, r16s):
                     f32_dst = ctx.alloc_f32()
-                    ctx.emit(f"cvt.f32.f16 {f32_dst}, {r};")
-                    ctx.bind_var(name, f32_dst, "f32")
-            else:
-                raise NotImplementedError(f"unsupported load width: {width}")
-            return
-        if ptx_dt == "bf16":
-            if width == 1:
-                r16 = ctx.alloc_u32()
-                ctx.emit(f"ld.{space}.b16 {r16}, [{addr}];")
-                f32_dst = ctx.alloc_f32()
-                r32 = ctx.alloc_u32()
-                ctx.emit(f"shl.b32 {r32}, {r16}, 16;")
-                ctx.emit(f"mov.b32 {f32_dst}, {r32};")
-                ctx.bind_var(s.names[0], f32_dst, "f32")
-            elif width in (2, 4):
-                r16s = [ctx.alloc_u32() for _ in range(width)]
-                vec = f"{{{', '.join(r16s)}}}"
-                ctx.emit(f"ld.{space}.v{width}.b16 {vec}, [{addr}];")
-                for name, r in zip(s.names, r16s):
-                    f32_dst = ctx.alloc_f32()
-                    r32 = ctx.alloc_u32()
-                    ctx.emit(f"shl.b32 {r32}, {r}, 16;")
-                    ctx.emit(f"mov.b32 {f32_dst}, {r32};")
+                    ctx.emit(f"{cvt_op} {f32_dst}, {r};")
                     ctx.bind_var(name, f32_dst, "f32")
             else:
                 raise NotImplementedError(f"unsupported load width: {width}")
@@ -308,6 +261,9 @@ class StmtLowerer:
             raise NotImplementedError(f"unsupported load width: {width}")
 
     def _lower_write(self, s: Any) -> None:
+        if getattr(s, "swizzle", "NONE") not in ("NONE", None, ""):
+            raise NotImplementedError(f"write swizzle {s.swizzle} not supported")
+
         ctx = self.ctx
         ptx_dt, elem_bytes = self._resolve_dtype(s.value_dtype)
         is_smem = s.output in self.smem_shapes
@@ -330,26 +286,13 @@ class StmtLowerer:
             return
 
         width = len(val_regs)
-        if ptx_dt == "f16":
+        if ptx_dt in ("f16", "bf16"):
+            cvt_op = f"cvt.rn.{ptx_dt}.f32"
             r16s = []
             for vr in val_regs:
-                r16 = ctx.alloc_u32()
-                ctx.emit(f"cvt.rn.f16.f32 {r16}, {vr};")
-                r16s.append(r16)
-            if width == 1:
-                ctx.emit(f"st.{space}.b16 [{addr}], {r16s[0]};")
-            elif width in (2, 4):
-                vec = f"{{{', '.join(r16s)}}}"
-                ctx.emit(f"st.{space}.v{width}.b16 [{addr}], {vec};")
-            else:
-                raise NotImplementedError(f"unsupported write width: {width}")
-            return
-        if ptx_dt == "bf16":
-            r16s = []
-            for vr in val_regs:
-                r16 = ctx.alloc_u32()
-                ctx.emit(f"cvt.rn.bf16.f32 {r16}, {vr};")
-                r16s.append(r16)
+                h = ctx.alloc_b16()
+                ctx.emit(f"{cvt_op} {h}, {vr};")
+                r16s.append(h)
             if width == 1:
                 ctx.emit(f"st.{space}.b16 [{addr}], {r16s[0]};")
             elif width in (2, 4):
@@ -566,6 +509,11 @@ class StmtLowerer:
         ctx.emit_label(lbl_skip)
 
     def _lower_cp_async_copy(self, s: Any) -> None:
+        if getattr(s, "swizzle", "NONE") not in ("NONE", None, ""):
+            raise NotImplementedError(f"cp.async swizzle {s.swizzle} not supported")
+        if s.nbytes not in (4, 8, 16):
+            raise NotImplementedError(f"unsupported cp.async nbytes: {s.nbytes}")
+
         ctx = self.ctx
         src_shape = self.buffer_shapes[s.src]
         src_flat = self._calc_flat_index(s.src_index, src_shape)

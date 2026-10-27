@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+from typing import Any
 import emmy.compiler.ir.expr as expr
 from .context import CodegenContext
 
@@ -8,6 +9,14 @@ from .context import CodegenContext
 def float_to_ptx_hex(val: float) -> str:
     b = struct.pack(">f", float(val))
     return f"0f{b.hex()}"
+
+
+def as_f32(ctx: CodegenContext, reg: str, dtype: str) -> str:
+    if dtype in ("f32", "float"):
+        return reg
+    pf = ctx.alloc_f32()
+    ctx.emit(f"cvt.rn.f32.s32 {pf}, {reg};")
+    return pf
 
 
 def calc_flat_index(ctx: CodegenContext, indices: tuple[Any, ...], shape: list[int]) -> str:
@@ -64,14 +73,10 @@ def lower_expr(ctx: CodegenContext, e: expr.Expr) -> tuple[str, str]:
         ptx_type = "f32" if is_float else "s32"
 
         if is_float:
-            if l_type != "f32":
-                pf = ctx.alloc_f32()
-                ctx.emit(f"cvt.rn.f32.s32 {pf}, {l_reg};")
-                l_reg = pf
-            if r_type != "f32":
-                pf = ctx.alloc_f32()
-                ctx.emit(f"cvt.rn.f32.s32 {pf}, {r_reg};")
-                r_reg = pf
+            if e.op in ("//", "%"):
+                raise TypeError(f"Operator {e.op!r} is not supported on float operands")
+            l_reg = as_f32(ctx, l_reg, l_type)
+            r_reg = as_f32(ctx, r_reg, r_type)
 
         if e.op == "+":
             dst = ctx.alloc_f32() if is_float else ctx.alloc_u32()
@@ -213,11 +218,7 @@ def lower_expr(ctx: CodegenContext, e: expr.Expr) -> tuple[str, str]:
         arg_regs = []
         for a in e.args:
             r, dt = lower_expr(ctx, a)
-            if dt != "f32":
-                pf = ctx.alloc_f32()
-                ctx.emit(f"cvt.rn.f32.s32 {pf}, {r};")
-                r = pf
-            arg_regs.append(r)
+            arg_regs.append(as_f32(ctx, r, dt))
         dst = ctx.alloc_f32()
         if e.name in ("exp", "exp_fast"):
             t = ctx.alloc_f32()

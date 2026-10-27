@@ -11,7 +11,7 @@ from typing import Any
 from emmy.compiler.graph import Graph
 import emmy.compiler.ir.kernel.ir as kir
 
-from compiler.context import CodegenContext
+from compiler.context import CodegenContext, resolve_dtype_info
 from compiler.stmts import StmtLowerer
 
 
@@ -83,21 +83,18 @@ def resolve_kernel(g: Graph, ir_path: Path, meta: dict[str, Any] | None) -> Kern
 def resolve_buffer_shapes(g: Graph, meta: dict[str, Any] | None) -> tuple[dict[str, list[int]], dict[str, int]]:
     shapes: dict[str, list[int]] = {}
     elem_bytes: dict[str, int] = {}
-    dtype_sizes = {"f32": 4, "float": 4, "s32": 4, "int32": 4, "f16": 2, "bf16": 2, "s64": 8, "u64": 8}
 
     for _, node in g.nodes.items():
         if hasattr(node, "outputs"):
             for out in node.outputs:
                 shapes[out.name] = [to_int(d) for d in out.shape] if out.shape else [1]
-                dt = getattr(out.dtype, "name", str(out.dtype) if out.dtype else "f32")
-                elem_bytes[out.name] = dtype_sizes.get(dt.lower(), 4)
+                elem_bytes[out.name] = resolve_dtype_info(out.dtype)[1]
     if meta and "args" in meta:
         for a in meta["args"]:
             name = a["name"]
             if name not in shapes:
                 shapes[name] = [to_int(d) for d in a["shape"]] if a.get("shape") else [1]
-            dt = a.get("dtype", "f32")
-            elem_bytes[name] = dtype_sizes.get(dt.lower(), 4)
+            elem_bytes[name] = resolve_dtype_info(a.get("dtype"))[1]
     return shapes, elem_bytes
 
 
@@ -344,6 +341,7 @@ def assemble_ptx(
     lines.append(f"\t.reg .f32\t%f<{ctx.num_f32 + 1}>;")
     lines.append(f"\t.reg .b32\t%r<{ctx.num_u32 + 1}>;")
     lines.append(f"\t.reg .b64\t%rd<{ctx.num_u64 + 1}>;")
+    lines.append(f"\t.reg .b16\t%h<{ctx.num_b16 + 1}>;")
     lines.append("")
 
     lines.extend(ctx.lines)
