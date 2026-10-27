@@ -1,5 +1,14 @@
 # Emmy Hackathon — write a PTX compiler for Kernel IR
 
+> **Architecture & Technical Documentation**: See [ARCHITECTURE.md](ARCHITECTURE.md) for full pipeline details, notable design decisions, limitations, and verification results across all 5 benchmark categories.
+
+### Quick Start & Verification
+- **Run compiler**: `python compile.py path/to/<kernel>.ir.json > out.ptx`
+- **Run test suite**: `python -m unittest discover tests -v` (16 unit and integration tests)
+- **Run benchmark**: `python submit.py <problem_name> --compiler compile.py` (15/15 PASS)
+
+---
+
 Emmy (github.com/cloudrift-ai/emmy) compiles PyTorch to CUDA C++ and builds it with `nvcc`.
 **Your task: write a compiler that takes Emmy's Kernel IR and emits PTX directly**, skipping the
 CUDA C++ step. `ptxas` turns PTX into the same GPU binary ~19× faster than the full `nvcc`
