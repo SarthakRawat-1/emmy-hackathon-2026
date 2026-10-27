@@ -14,9 +14,15 @@ def float_to_ptx_hex(val: float) -> str:
 def as_f32(ctx: CodegenContext, reg: str, dtype: str) -> str:
     if dtype in ("f32", "float"):
         return reg
-    pf = ctx.alloc_f32()
-    ctx.emit(f"cvt.rn.f32.s32 {pf}, {reg};")
-    return pf
+    if dtype in ("s32", "int32", "int"):
+        pf = ctx.alloc_f32()
+        ctx.emit(f"cvt.rn.f32.s32 {pf}, {reg};")
+        return pf
+    if dtype in ("u32", "uint32"):
+        pf = ctx.alloc_f32()
+        ctx.emit(f"cvt.rn.f32.u32 {pf}, {reg};")
+        return pf
+    raise NotImplementedError(f"cannot convert dtype {dtype!r} to f32")
 
 
 def calc_flat_index(ctx: CodegenContext, indices: tuple[Any, ...], shape: list[int]) -> str:
@@ -63,7 +69,8 @@ def lower_expr(ctx: CodegenContext, e: expr.Expr) -> tuple[str, str]:
             return reg, "f32"
         reg = ctx.alloc_u32()
         ctx.emit(f"mov.u32 {reg}, {int(e.value)};")
-        return reg, "s32"
+        dt = "u32" if e.dtype in ("u32", "uint32") else "s32"
+        return reg, dt
 
     if isinstance(e, expr.BinaryExpr):
         l_reg, l_type = lower_expr(ctx, e.left)

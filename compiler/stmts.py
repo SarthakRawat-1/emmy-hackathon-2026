@@ -122,17 +122,12 @@ class StmtLowerer:
         else:
             self.ctx.emit(f"bar.sync {barrier_id}, {count};")
 
-    @staticmethod
-    def _resolve_dtype(dtype: Any) -> tuple[str, int]:
-        return resolve_dtype_info(dtype)
-
     def _lower_init(self, s: Any) -> None:
         ctx = self.ctx
         reg = ctx.alloc_f32()
-        if isinstance(s.identity, (int, float)):
-            ctx.emit(f"mov.f32 {reg}, {float_to_ptx_hex(s.identity)};")
-        else:
-            ctx.emit(f"mov.f32 {reg}, 0f00000000;")
+        if not isinstance(s.identity, (int, float)):
+            raise NotImplementedError(f"unsupported Init identity type: {type(s.identity)}")
+        ctx.emit(f"mov.f32 {reg}, {float_to_ptx_hex(s.identity)};")
         ctx.bind_var(s.name, reg, "f32")
 
     def _lower_let(self, s: Any) -> None:
@@ -218,7 +213,7 @@ class StmtLowerer:
 
     def _lower_load(self, s: Any) -> None:
         ctx = self.ctx
-        ptx_dt, elem_bytes = self._resolve_dtype(s.dtype)
+        ptx_dt, elem_bytes = resolve_dtype_info(s.dtype)
         is_smem = s.input in self.smem_shapes
         shape = self.smem_shapes[s.input] if is_smem else self.buffer_shapes[s.input]
         flat_idx = self._calc_flat_index(s.index, shape)
@@ -265,7 +260,7 @@ class StmtLowerer:
             raise NotImplementedError(f"write swizzle {s.swizzle} not supported")
 
         ctx = self.ctx
-        ptx_dt, elem_bytes = self._resolve_dtype(s.value_dtype)
+        ptx_dt, elem_bytes = resolve_dtype_info(s.value_dtype)
         is_smem = s.output in self.smem_shapes
         shape = self.smem_shapes[s.output] if is_smem else self.buffer_shapes[s.output]
         flat_idx = self._calc_flat_index(s.index, shape)
@@ -273,15 +268,19 @@ class StmtLowerer:
         val_regs: list[str] = []
         for v in s.values:
             if isinstance(v, str):
-                val_regs.append(ctx.get_var(v)[0])
+                vr, vdt = ctx.get_var(v)
             else:
-                vr, _ = lower_expr(ctx, v)
-                val_regs.append(vr)
+                vr, vdt = lower_expr(ctx, v)
+            if ptx_dt in ("f32", "f16", "bf16"):
+                vr = as_f32(ctx, vr, vdt)
+            val_regs.append(vr)
 
         space = "shared" if is_smem else "global"
         addr = self._get_smem_addr(s.output, flat_idx) if is_smem else self._get_buffer_addr(s.output, flat_idx)
 
         if not is_smem and getattr(s, "atomic", False):
+            if ptx_dt != "f32":
+                raise NotImplementedError(f"atomic write not supported for dtype {ptx_dt}")
             ctx.emit(f"red.global.add.f32 [{addr}], {val_regs[0]};")
             return
 
